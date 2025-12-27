@@ -9,7 +9,7 @@ env:
 jobs:
   export-ios-unsigned:
     name: iOS Export
-    runs-on: macos-15
+    runs-on: macos-13
     steps:
       - name: Setup Godot
         run: |
