@@ -12,6 +12,7 @@ public partial class Options : Node
     private LineEdit _spiceApiPasswordEdit;
     private Label _spiceApiPasswordLabel;
     // private CheckButton _spiceApiUseUdp;
+    private CheckButton _useUsb;
     private CheckButton _debugTouch;
     private Slider _faderAreaSlider;
     private Label _faderAreaLabel;
@@ -28,6 +29,9 @@ public partial class Options : Node
         _spiceApiPasswordEdit = GetNode<LineEdit>("Control/Container/ScrollContainer/MarginContainer/VBoxContainer/SpiceApiPassword");
         _spiceApiPasswordLabel = GetNode<Label>("Control/Container/ScrollContainer/MarginContainer/VBoxContainer/SpiceApiPasswordLabel");
         // _spiceApiUseUdp = GetNode<CheckButton>("Control/Container/VBoxContainer/SpiceApiUseUdp");
+        _useUsb = GetNode<CheckButton>("Control/Container/ScrollContainer/MarginContainer/VBoxContainer/SpiceApiUseUdp");
+        _useUsb.Visible = true;
+        _useUsb.Text = "USE USB CONNECTION:";
 
         _debugTouch = GetNode<CheckButton>("Control/Container/ScrollContainer/MarginContainer/VBoxContainer/DebugTouch");
 
@@ -47,6 +51,7 @@ public partial class Options : Node
         _spiceApiPortEdit.Text = _config.SpiceApiPort.ToString();
         _spiceApiPasswordEdit.Text = _config.SpiceApiPassword;
         // _spiceApiUseUdp.ButtonPressed = _config.UseUdp;
+        _useUsb.ButtonPressed = _config.UseUsb;
         _debugTouch.ButtonPressed = _config.DebugTouch;
         _faderAreaSlider.Value = _config.FaderAreaSize * 100;
         _faderDeadzoneSlider.Value = _config.FaderDeadZone;
@@ -83,6 +88,7 @@ public partial class Options : Node
             _config.SpiceApiPort = portParsed;
             _config.SpiceApiPassword = _spiceApiPasswordEdit.Text;
             // _config.UseUdp = _spiceApiUseUdp.ButtonPressed;
+            _config.UseUsb = _useUsb.ButtonPressed;
             _config.DebugTouch = _debugTouch.ButtonPressed;
             _config.FaderAreaSize = (float)(_faderAreaSlider.Value / 100);
             _config.FaderDeadZone = (float)_faderDeadzoneSlider.Value;

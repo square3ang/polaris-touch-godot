@@ -123,7 +123,14 @@ public partial class View : Node
 
         var spiceHostLabel = GetNode<Label>("UI/Status/HBoxContainer/SpiceApiAddress");
 
-        _connection = new UdpSpiceAPI(_config.SpiceApiHost, _config.SpiceApiPort, _config.SpiceApiPassword);
+        if (_config.UseUsb)
+        {
+            _connection = new UsbmuxSpiceAPI(_config.SpiceApiPort, _config.SpiceApiPassword);
+        }
+        else
+        {
+            _connection = new UdpSpiceAPI(_config.SpiceApiHost, _config.SpiceApiPort, _config.SpiceApiPassword);
+        }
 
         spiceHostLabel.Text = _connection.SpiceHost;
 

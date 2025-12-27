@@ -8,6 +8,7 @@ class Config
     public ushort SpiceApiPort { get; set; }
     public string SpiceApiPassword { get; set; }
     public bool UseUdp { get; set; }
+    public bool UseUsb { get; set; }
 
     public bool DebugTouch { get; set; }
     public float FaderAreaSize { get; set; }
@@ -37,6 +38,7 @@ class Config
         SpiceApiPassword = "";
         FaderAreaSize = 0.5f;
         UseUdp = true;
+        UseUsb = false;
     }
 
     public bool TryReload()
@@ -55,6 +57,7 @@ class Config
         SpiceApiPassword = config.GetValue("spice_api", "password", "").As<string>();
         // UseUdp = config.GetValue("spice_api", "use_udp", true).As<bool>();
         UseUdp = true;
+        UseUsb = config.GetValue("spice_api", "use_usb", false).As<bool>();
         DebugTouch = config.GetValue("controller", "debug_touch", false).As<bool>();
         FaderAreaSize = config.GetValue("controller", "fader_area_size", 0.5f).As<float>();
         FaderDeadZone = config.GetValue("controller", "fader_dead_zone", 10.0f).As<float>();
@@ -70,6 +73,7 @@ class Config
         config.SetValue("spice_api", "port", SpiceApiPort);
         config.SetValue("spice_api", "password", SpiceApiPassword);
         // config.SetValue("spice_api", "use_udp", UseUdp);
+        config.SetValue("spice_api", "use_usb", UseUsb);
         config.SetValue("controller", "debug_touch", DebugTouch);
         config.SetValue("controller", "fader_area_size", FaderAreaSize);
         config.SetValue("controller", "fader_dead_zone", FaderDeadZone);
