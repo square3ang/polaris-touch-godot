@@ -46,15 +46,18 @@ jobs:
 
       - name: Import Assets
         run: |
+          export DOTNET_ROOT=$DOTNET_ROOT
+          export GODOT_MONO_LOG_LEVEL=debug
           cd $PROJECT_PATH
-          godot-mono --headless --verbose --editor --quit
+          godot-mono --headless --verbose --audio-driver Dummy --editor --quit
 
       - name: iOS Export
         run: |
+          export DOTNET_ROOT=$DOTNET_ROOT
           mkdir -v -p build/ios
           EXPORT_DIR="$(readlink -f build)"
           cd $PROJECT_PATH
-          godot-mono --headless --verbose --export-release "iOS" $EXPORT_DIR/ios/polaris-touch.xcodeproj
+          godot-mono --headless --verbose --audio-driver Dummy --export-release "iOS" $EXPORT_DIR/ios/polaris-touch.xcodeproj
 
       - name: iOS Build
         run: |
