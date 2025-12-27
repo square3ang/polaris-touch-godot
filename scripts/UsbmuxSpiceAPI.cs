@@ -22,7 +22,8 @@ class UsbmuxSpiceAPI : ISpiceAPI
     private RC4 _rc4;
 
     private readonly ConcurrentQueue<string> _pendingOutputs = new();
-    private readonly ConcurrentQueue<TaskCompletionSource<RentedBuffer>> _recvQueue = new();
+    // Using byte[] directly for internal queues to avoid RentedBuffer complexity across threads
+    private readonly ConcurrentQueue<TaskCompletionSource<byte[]>> _recvQueue = new();
     private readonly Thread _thread;
 
     private bool _disposed = false;
@@ -77,10 +78,8 @@ class UsbmuxSpiceAPI : ISpiceAPI
                         Connected = true;
                         GD.Print("Client connected via USB/TCP");
                         
-                        // Reset RC4 on new connection
                         _rc4?.Reset();
                         
-                        // Clear queues
                         while (_recvQueue.TryDequeue(out var tcs)) tcs.SetCanceled();
                         _pendingOutputs.Clear();
                     }
@@ -99,7 +98,6 @@ class UsbmuxSpiceAPI : ISpiceAPI
         }
     }
 
-    // Read Loop: Reads [Length][EncryptedData] -> Decrypt -> RecvQueue
     private async void RunReadLoop()
     {
          var lenBuf = new byte[4];
@@ -127,42 +125,22 @@ class UsbmuxSpiceAPI : ISpiceAPI
                      continue;
                  }
                  
-                 using var buffer = new RentedBuffer(len);
+                 // Alloc buffer for packet
+                 var buffer = new byte[len];
                  read = 0;
                  while (read < len) {
-                     int r = await _stream.ReadAsync(buffer.Span.Slice(read), _stopThread.Token);
+                     int r = await _stream.ReadAsync(buffer, read, len - read, _stopThread.Token);
                      if (r == 0) throw new EndOfStreamException();
                      read += r;
                  }
 
-                 // We have a full packet.
-                 // Decrypt logic? Wait, where do we decrypt?
-                 // Original logic passed to _recvQueue.
-                 
-                 // We need to copy to a new RentedBuffer for the queue consumer
-                 var packet = new RentedBuffer(len);
-                 buffer.Span.Slice(0, len).CopyTo(packet.Span);
-                 
-                 // We push to recvQueue?
-                 // The original architecture used TaskCompletionSource queue for request-response matching?
-                 // Check SendAsync approach.
-                 // SendAsync enqueues a TaskCompletionSource.
-                 // WaitForResponse waits for it.
-                 // KcpRecv dequeued TCS and SetResult.
-                 
-                 // So we must match incoming packets to pending requests?
-                 // Or is it just a stream?
-                 // UDP/SpiceAPI is usually Request -> Response.
-                 // So we should dequeue the pending TCS.
-                 
                  lock (_sessionLock) {
                      if (_recvQueue.TryDequeue(out var tcs)) {
-                         tcs.SetResult(packet);
+                         tcs.SetResult(buffer);
                          Connected = true;
                          _lastActive = Time.GetTicksMsec();
                      } else {
-                         // Unsolicited packet? Or queue empty.
-                         packet.Dispose();
+                         // Unhandled packet
                      }
                  }
              }
@@ -179,14 +157,13 @@ class UsbmuxSpiceAPI : ISpiceAPI
     void UpdateThread()
     { 
         RunReadLoop();
-        
         while (_stopThread?.IsCancellationRequested == false)
         {
             Thread.Sleep(100);
         }
     }
 
-    async ValueTask<bool> WaitForResponse(ulong startTime, TaskCompletionSource<RentedBuffer> taskSource)
+    async ValueTask<bool> WaitForResponse(ulong startTime, TaskCompletionSource<byte[]> taskSource)
     {
         var completedTask = await Task.WhenAny(taskSource.Task, Task.Delay(2000));
         if (completedTask != taskSource.Task)
@@ -195,12 +172,11 @@ class UsbmuxSpiceAPI : ISpiceAPI
         if (taskSource.Task.IsCanceled)
             return false;
 
-        using var response = taskSource.Task.Result;
+        var response = taskSource.Task.Result;
         if (response == null)
             return false;
 
-        // Decrypt Response HERE
-        _rc4?.Crypt(response.Span);
+        _rc4?.Crypt(response);
 
         var dur = Time.GetTicksMsec() - startTime;
         _latencies.Add((int)dur);
@@ -217,42 +193,43 @@ class UsbmuxSpiceAPI : ISpiceAPI
     async ValueTask<bool> SendAsync(string data)
     {
         var byteLen = Encoding.UTF8.GetByteCount(data);
-        // Framing: [Len:4][Data]
-        // But we just need the Data buffer here, framing happens in Write
-        
-        using var buffer = new RentedBuffer(byteLen + 1);
-        Encoding.ASCII.GetBytes(data, buffer.Span);
-        buffer.Span[byteLen] = 0;
+        var buffer = ArrayPool<byte>.Shared.Rent(byteLen + 1);
+        try 
+        {
+            Encoding.ASCII.GetBytes(data, buffer.AsSpan(0, byteLen));
+            buffer[byteLen] = 0;
 
-        _rc4?.Crypt(buffer.Span);
+            _rc4?.Crypt(buffer.AsSpan(0, byteLen + 1));
 
-        var start = Time.GetTicksMsec();
-        
-        // Enqueue waiter BEFORE sending to race correctly
-        var taskSource = new TaskCompletionSource<RentedBuffer>();
-        _recvQueue.Enqueue(taskSource);
+            var start = Time.GetTicksMsec();
+            
+            var taskSource = new TaskCompletionSource<byte[]>();
+            _recvQueue.Enqueue(taskSource);
 
-        try {
-            if (_client != null && _client.Connected) {
-                // Send Length
-                var lenBytes = BitConverter.GetBytes(byteLen + 1);
-                 await _stream.WriteAsync(lenBytes, 0, 4);
-                 // Send Data
-                 await _stream.WriteAsync(buffer.Span.Slice(0, byteLen + 1).ToArray());
-            } else {
+            try {
+                if (_client != null && _client.Connected) {
+                    var lenBytes = BitConverter.GetBytes(byteLen + 1);
+                     await _stream.WriteAsync(lenBytes, 0, 4);
+                     await _stream.WriteAsync(buffer, 0, byteLen + 1);
+                } else {
+                    return false;
+                }
+            } catch {
                 return false;
             }
-        } catch {
-            return false;
-        }
 
-        if (_rc4 is not null)
+            if (_rc4 is not null)
+            {
+                return await WaitForResponse(start, taskSource);
+            }
+
+            _ = WaitForResponse(start, taskSource);
+            return true;
+        } 
+        finally 
         {
-            return await WaitForResponse(start, taskSource);
+            ArrayPool<byte>.Shared.Return(buffer);
         }
-
-        _ = WaitForResponse(start, taskSource);
-        return true;
     }
 
     private async void RunSendTasks()
@@ -273,7 +250,7 @@ class UsbmuxSpiceAPI : ISpiceAPI
                 var success = await SendAsync(data);
                 if (!success && Time.GetTicksMsec() - _lastActive > 2000)
                 {
-                     // Timeout
+                     // Timeout logic
                 }
             }
             catch (TaskCanceledException)
