@@ -49,7 +49,7 @@ jobs:
           export DOTNET_ROOT=$DOTNET_ROOT
           export GODOT_MONO_LOG_LEVEL=debug
           cd $PROJECT_PATH
-          godot-mono --headless --verbose --audio-driver Dummy --editor --quit
+          godot-mono --headless --verbose --audio-driver Dummy --rendering-driver gl_compatibility --editor --quit
 
       - name: iOS Export
         run: |
@@ -57,7 +57,7 @@ jobs:
           mkdir -v -p build/ios
           EXPORT_DIR="$(readlink -f build)"
           cd $PROJECT_PATH
-          godot-mono --headless --verbose --audio-driver Dummy --export-release "iOS" $EXPORT_DIR/ios/polaris-touch.xcodeproj
+          godot-mono --headless --verbose --audio-driver Dummy --rendering-driver gl_compatibility --export-release "iOS" $EXPORT_DIR/ios/polaris-touch.xcodeproj
 
       - name: iOS Build
         run: |
