@@ -213,7 +213,6 @@ function startProxy(tunnel, initialData) {
         });
 
         ws.on('close', () => {
-            console.log('Game Server WebSocket disconnected. Reconnecting in 1s...');
             scheduleReconnect();
         });
 
@@ -225,7 +224,7 @@ function startProxy(tunnel, initialData) {
 
     function scheduleReconnect() {
         if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
-        state.reconnectTimer = setTimeout(connectGameServer, 1000);
+        state.reconnectTimer = setTimeout(connectGameServer, 0);
     }
 
     // Tunnel Events
