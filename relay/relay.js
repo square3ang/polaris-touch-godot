@@ -139,16 +139,6 @@ function connectToDeviceCombined(id) {
     // Create a NEW socket to usbmuxd for the tunnel
     const tunnel = net.createConnection({ port: USBMUXD_PORT, host: USBMUXD_HOST }, () => {
         // Send Connect Packet
-        // Note: 'PortNumber' must be Big Endian for the Connect command in newer usbmuxd? 
-        // Actually, the usbmuxd protocol specifies PortNumber as integer in the plist.
-        // But the On-The-Wire protocol for the *tunneled* connection takes over after success.
-
-        // Wait, standard Connect message uses 'PortNumber' in the plist but with Htons (network byte order)? 
-        // The standard spec says "PortNumber: The TCP port number to connect to, in network byte order usually (big endian 16 bit swapped to 32 bit int)".
-        // Let's try standard integer first, if fails, try byte swap.
-        // Actually, for plist based usbmux, it expects the port as an integer value. But historical quirks exist.
-        // Usually: ((port << 8) & 0xFF00) | ((port >> 8) & 0x00FF)
-
         const portSwapped = ((DEVICE_PORT << 8) & 0xFF00) | ((DEVICE_PORT >> 8) & 0x00FF);
 
         const packet = createPacket({
@@ -164,30 +154,56 @@ function connectToDeviceCombined(id) {
 
     tunnel.once('data', (data) => {
         // We expect a RESULT packet
-        // Header(16) + Plist
-        // Check for <key>Number</key><integer>0</integer> inside
+        // Log raw for debugging
+        console.log('Tunnel Response (Hex):', data.toString('hex'));
+        console.log('Tunnel Response (Text):', data.toString());
+
         const str = data.toString();
 
         if (str.includes('<key>Number</key>') && str.includes('<integer>0</integer>')) {
             console.log('Tunnel Established! Bridging to Game Server...');
-
-            // Remove the header/plist from the stream?
-            // Yes, anything AFTER this packet is raw stream data.
-            // But usually 'data' chunk contains *just* the response if we are lucky.
-            // If the chunk is larger, we need to slice it.
 
             const len = data.readUInt32LE(0);
             const remaining = data.slice(len);
 
             startProxy(tunnel, remaining);
         } else {
-            console.error('Tunnel Connect Failed. Response:', str);
+            console.error('Tunnel Connect Failed. Trying non-swapped port...');
             tunnel.end();
+            // Retry with Little Endian Port?
+            connectToDeviceSimple(id);
         }
     });
 
     tunnel.on('error', (err) => {
         console.error('Tunnel Socket Error:', err);
+    });
+}
+
+function connectToDeviceSimple(id) {
+    console.log(`Retry: Connecting to Device ${id} Port ${DEVICE_PORT} (Little Endian)...`);
+    const tunnel = net.createConnection({ port: USBMUXD_PORT, host: USBMUXD_HOST }, () => {
+        const packet = createPacket({
+            'MessageType': 'Connect',
+            'ClientVersionString': 'polaris-relay-1.0',
+            'ProgName': 'polaris-relay',
+            'DeviceID': id,
+            'PortNumber': DEVICE_PORT // No Swap
+        });
+        tunnel.write(packet);
+    });
+
+    tunnel.once('data', (data) => {
+        console.log('Retry Response (Hex):', data.toString('hex'));
+        const str = data.toString();
+        if (str.includes('<integer>0</integer>')) {
+            console.log('Tunnel Established (Little Endian)!');
+            const len = data.readUInt32LE(0);
+            startProxy(tunnel, data.slice(len));
+        } else {
+            console.error('Retry Failed.');
+            tunnel.end();
+        }
     });
 }
 

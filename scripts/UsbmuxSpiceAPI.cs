@@ -98,9 +98,12 @@ class UsbmuxSpiceAPI : ISpiceAPI
         }
     }
 
+    // Read Loop: Reads until \0 (Null Terminator) -> Decrypt -> RecvQueue
     private async void RunReadLoop()
     {
-         var lenBuf = new byte[4];
+         var oneByte = new byte[1]; 
+         var messageBuffer = new List<byte>(4096);
+
          while (!_disposed)
          {
              try 
@@ -110,33 +113,27 @@ class UsbmuxSpiceAPI : ISpiceAPI
                      continue;
                  }
                  
-                 // Read Length
-                 int read = 0; 
-                 while (read < 4) {
-                     int r = await _stream.ReadAsync(lenBuf, read, 4 - read, _stopThread.Token);
+                 messageBuffer.Clear();
+                 bool foundNull = false;
+                 
+                 while (!foundNull) {
+                     int r = await _stream.ReadAsync(oneByte, 0, 1, _stopThread.Token);
                      if (r == 0) throw new EndOfStreamException();
-                     read += r;
+                     
+                     if (oneByte[0] == 0) {
+                         foundNull = true;
+                     } else {
+                         messageBuffer.Add(oneByte[0]);
+                     }
+                     
+                     if (messageBuffer.Count > 65536) throw new Exception("Message too large");
                  }
                  
-                 int len = BitConverter.ToInt32(lenBuf, 0);
-                 if (len > 65535 || len < 0) {
-                     GD.PrintErr($"Invalid frame length {len}, disconnecting");
-                     _client.Close();
-                     continue;
-                 }
-                 
-                 // Alloc buffer for packet
-                 var buffer = new byte[len];
-                 read = 0;
-                 while (read < len) {
-                     int r = await _stream.ReadAsync(buffer, read, len - read, _stopThread.Token);
-                     if (r == 0) throw new EndOfStreamException();
-                     read += r;
-                 }
+                 var packet = messageBuffer.ToArray();
 
                  lock (_sessionLock) {
                      if (_recvQueue.TryDequeue(out var tcs)) {
-                         tcs.SetResult(buffer);
+                         tcs.SetResult(packet);
                          Connected = true;
                          _lastActive = Time.GetTicksMsec();
                      } else {
@@ -208,8 +205,7 @@ class UsbmuxSpiceAPI : ISpiceAPI
 
             try {
                 if (_client != null && _client.Connected) {
-                    var lenBytes = BitConverter.GetBytes(byteLen + 1);
-                     await _stream.WriteAsync(lenBytes, 0, 4);
+                     // NO Length Prefix! Just data + null (which is in buffer)
                      await _stream.WriteAsync(buffer, 0, byteLen + 1);
                 } else {
                     return false;
