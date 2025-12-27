@@ -7,22 +7,18 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
-using System.Net.Sockets.Kcp;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
-class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
+class UsbmuxSpiceAPI : ISpiceAPI
 {
-    const int KCP_TIMEOUT_MSEC = 2000;
-
     private TcpListener _listener;
     private TcpClient _client;
     private NetworkStream _stream;
     
     private CancellationTokenSource _stopThread = new();
     private object _sessionLock = new();
-    private SimpleSegManager.Kcp _kcp;
     private RC4 _rc4;
 
     private readonly ConcurrentQueue<string> _pendingOutputs = new();
@@ -56,8 +52,6 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
             GD.PrintErr($"Failed to start TCP listener: {e.Message}");
         }
 
-        RecreateKcpSession();
-
         _thread = new Thread(UpdateThread);
         _thread.Start();
 
@@ -82,6 +76,13 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
                         _lastActive = Time.GetTicksMsec();
                         Connected = true;
                         GD.Print("Client connected via USB/TCP");
+                        
+                        // Reset RC4 on new connection
+                        _rc4?.Reset();
+                        
+                        // Clear queues
+                        while (_recvQueue.TryDequeue(out var tcs)) tcs.SetCanceled();
+                        _pendingOutputs.Clear();
                     }
                 }
                 else
@@ -98,103 +99,7 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
         }
     }
 
-    private void RecreateKcpSession()
-    {
-        _pendingOutputs.Clear();
-
-        lock (_sessionLock)
-        {
-            while (_recvQueue.TryDequeue(out var tcs))
-                tcs.SetCanceled();
-
-            _recvQueue.Clear();
-            _kcp?.Dispose();
-
-            _kcp = new(573, this);
-            // fast mode
-            _kcp.NoDelay(1, 0, 2, 1);
-            _rc4?.Reset();
-
-            _lastActive = Time.GetTicksMsec();
-        }
-    }
-
-    // Buffer for reading length prefix
-    private byte[] _lenBuf = new byte[4];
-    // Buffer for reading payload
-    private byte[] _readBuf = new byte[4096];
-
-    private bool RawRecv()
-    {
-        if (_client == null || !_client.Connected || _stream == null)
-            return false;
-
-        try
-        {
-            if (_client.Available < 4) return false;
-
-            // Peek length? No, just read. If we assume reliable stream.
-            // But we can't block. TcpClient.Available checks readable bytes.
-            
-            // We need to read framing.
-            // [Length (4 bytes LE)] [Data]
-            
-            // This is slightly complex in a non-async loop without keeping state.
-            // But since this is called in a loop, we can try to read if enough data.
-            
-            // Ideally we need a state machine here if partial reads happen.
-            // Since this is localhost/USB, fragmentation is unlikely but possible.
-            
-            // For simplicity in this loop logic:
-            if (_client.Available >= 4)
-            {
-                // We shouldn't block, forcing small reads might be okay if local.
-                // But better to use async read or buffering.
-                // Here we are in a Thread loop.
-                
-                // Let's implement a simple buffering
-                // Actually, let's just use blocking read with available check?
-                // No, Available provides total bytes.
-                
-                // Read 4 bytes
-                // _stream.Read is blocking. But if Available >= 4, it should return immediately.
-                
-                // We can't guarantee 4 bytes are together though.
-                // However, let's attempt to read length header.
-                // If we don't have enough for body, we wait?
-                
-                // To do this robustly: separate read loop pushing to a concurrent queue or buffer.
-                // But `RawRecv` feeds `_kcp`.
-                
-                // I'll stick to a simple check:
-                // Only read if we have at least 4 bytes.
-                // Then peek/read length.
-                // Then check if we have length bytes.
-                // If so, read and input.
-                
-                // Note: Available is an estimate.
-                
-                // Peek 4 bytes? NetworkStream isn't peekable easily.
-                // We'll maintain a RecvState.
-                return false; // See specialized implementation below
-            }
-        }
-        catch (Exception ex)
-        {
-            GD.PrintErr($"Socket error: {ex.Message}");
-            Connected = false;
-            _client?.Close();
-            _client = null;
-        }
-
-        return false;
-    }
-    
-    // Simplification: We will run a separate Async Read loop for the stream to handle framing
-    // and push completed frames to a queue which KcpUpdate consumes.
-    
-    private ConcurrentQueue<byte[]> _incomingFrames = new();
-    
+    // Read Loop: Reads [Length][EncryptedData] -> Decrypt -> RecvQueue
     private async void RunReadLoop()
     {
          var lenBuf = new byte[4];
@@ -202,7 +107,7 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
          {
              try 
              {
-                 if (_client == null || !_client.Connected) {
+                 if (_client == null || !_client.Connected || _stream == null) {
                      await Task.Delay(100);
                      continue;
                  }
@@ -222,20 +127,47 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
                      continue;
                  }
                  
-                 var buf = new byte[len];
+                 using var buffer = new RentedBuffer(len);
                  read = 0;
                  while (read < len) {
-                     int r = await _stream.ReadAsync(buf, read, len - read, _stopThread.Token);
+                     int r = await _stream.ReadAsync(buffer.Span.Slice(read), _stopThread.Token);
                      if (r == 0) throw new EndOfStreamException();
                      read += r;
                  }
+
+                 // We have a full packet.
+                 // Decrypt logic? Wait, where do we decrypt?
+                 // Original logic passed to _recvQueue.
                  
-                 _incomingFrames.Enqueue(buf);
-                 _lastActive = Time.GetTicksMsec();
+                 // We need to copy to a new RentedBuffer for the queue consumer
+                 var packet = new RentedBuffer(len);
+                 buffer.Span.Slice(0, len).CopyTo(packet.Span);
+                 
+                 // We push to recvQueue?
+                 // The original architecture used TaskCompletionSource queue for request-response matching?
+                 // Check SendAsync approach.
+                 // SendAsync enqueues a TaskCompletionSource.
+                 // WaitForResponse waits for it.
+                 // KcpRecv dequeued TCS and SetResult.
+                 
+                 // So we must match incoming packets to pending requests?
+                 // Or is it just a stream?
+                 // UDP/SpiceAPI is usually Request -> Response.
+                 // So we should dequeue the pending TCS.
+                 
+                 lock (_sessionLock) {
+                     if (_recvQueue.TryDequeue(out var tcs)) {
+                         tcs.SetResult(packet);
+                         Connected = true;
+                         _lastActive = Time.GetTicksMsec();
+                     } else {
+                         // Unsolicited packet? Or queue empty.
+                         packet.Dispose();
+                     }
+                 }
              }
              catch (Exception)
              {
-                 // Lost connection
                  Connected = false;
                  _client?.Close();
                  _client = null;
@@ -244,58 +176,19 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
          }
     }
 
-
-    private void KcpUpdate()
-    {
-        var now = DateTimeOffset.UtcNow;
-        if (_kcp.Check(now) >= now)
-            _kcp.Update(now);
-    }
-
-    private void KcpRecv()
-    {
-        if (_recvQueue.Count == 0)
-            return;
-
-        var (result, len) = _kcp.TryRecv();
-        if (len <= 0)
-            return;
-
-        var buffer = new RentedBuffer(len);
-        result.Memory.Span.CopyTo(buffer.Span);
-
-        if (_recvQueue.TryDequeue(out var source))
-            source.SetResult(buffer);
-
-        Connected = true;
-        _lastActive = Time.GetTicksMsec();
-    }
-
     void UpdateThread()
     { 
-        // Start read loop background task
         RunReadLoop();
         
         while (_stopThread?.IsCancellationRequested == false)
         {
-            lock (_sessionLock)
-            {
-                // Process incoming frames
-                while (_incomingFrames.TryDequeue(out var frame)) 
-                {
-                     _kcp.Input(frame);
-                }
-                
-                KcpUpdate();
-                KcpRecv();
-            }
-            Thread.Sleep(5);
+            Thread.Sleep(100);
         }
     }
 
     async ValueTask<bool> WaitForResponse(ulong startTime, TaskCompletionSource<RentedBuffer> taskSource)
     {
-        var completedTask = await Task.WhenAny(taskSource.Task, Task.Delay(KCP_TIMEOUT_MSEC));
+        var completedTask = await Task.WhenAny(taskSource.Task, Task.Delay(2000));
         if (completedTask != taskSource.Task)
             return false;
 
@@ -306,6 +199,7 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
         if (response == null)
             return false;
 
+        // Decrypt Response HERE
         _rc4?.Crypt(response.Span);
 
         var dur = Time.GetTicksMsec() - startTime;
@@ -323,8 +217,10 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
     async ValueTask<bool> SendAsync(string data)
     {
         var byteLen = Encoding.UTF8.GetByteCount(data);
+        // Framing: [Len:4][Data]
+        // But we just need the Data buffer here, framing happens in Write
+        
         using var buffer = new RentedBuffer(byteLen + 1);
-
         Encoding.ASCII.GetBytes(data, buffer.Span);
         buffer.Span[byteLen] = 0;
 
@@ -332,12 +228,23 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
 
         var start = Time.GetTicksMsec();
         
-        lock(_sessionLock) {
-            _kcp.Send(buffer.Span);
-        }
-
+        // Enqueue waiter BEFORE sending to race correctly
         var taskSource = new TaskCompletionSource<RentedBuffer>();
         _recvQueue.Enqueue(taskSource);
+
+        try {
+            if (_client != null && _client.Connected) {
+                // Send Length
+                var lenBytes = BitConverter.GetBytes(byteLen + 1);
+                 await _stream.WriteAsync(lenBytes, 0, 4);
+                 // Send Data
+                 await _stream.WriteAsync(buffer.Span.Slice(0, byteLen + 1).ToArray());
+            } else {
+                return false;
+            }
+        } catch {
+            return false;
+        }
 
         if (_rc4 is not null)
         {
@@ -364,11 +271,9 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
             try
             {
                 var success = await SendAsync(data);
-                if (!success || Time.GetTicksMsec() - _lastActive > KCP_TIMEOUT_MSEC)
+                if (!success && Time.GetTicksMsec() - _lastActive > 2000)
                 {
-                     // Connection timeout or failure logic
-                     // For USB, we might not want to aggressively reconnect locally, 
-                     // but we should detect if PC disconnected.
+                     // Timeout
                 }
             }
             catch (TaskCanceledException)
@@ -387,7 +292,6 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
     {
         if (!Connected)
             return;
-
         Send("");
     }
 
@@ -397,8 +301,7 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
 
     public void SendButtonsState(ReadOnlySpan<int> state)
     {
-        if (state.Length > 12)
-            return;
+        if (state.Length > 12) return;
 
         int paramCount = 0;
         for (int i = 0; i < state.Length; i++)
@@ -406,12 +309,10 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
             var on = state[i] > 0;
             if (!Connected || _oldStates[i] != on)
                 packetParamsBuffer[paramCount++] = $"[\"Button {i + 1}\",{(on ? "1" : "0")}]";
-
             _oldStates[i] = on;
         }
 
-        if (paramCount == 0)
-            return;
+        if (paramCount == 0) return;
 
         var paramStr = string.Join(',', packetParamsBuffer.Take(paramCount));
         Send($"{{\"id\":{_lastId++},\"module\":\"buttons\",\"function\":\"write\",\"params\":[{paramStr}]}}");
@@ -423,20 +324,16 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
     public void SendAnalogsState(float left, float right)
     {
         int paramCount = 0;
-        if (!Connected || MathF.Abs(left - _lastLeftFader) > 0.01f)
-        {
+        if (!Connected || MathF.Abs(left - _lastLeftFader) > 0.01f) {
             _lastLeftFader = left;
             packetParamsBuffer[paramCount++] = $"[\"Fader-L\",{left:F2}]";
         }
-
-        if (!Connected || MathF.Abs(right - _lastRightFader) > 0.01f)
-        {
+        if (!Connected || MathF.Abs(right - _lastRightFader) > 0.01f) {
             _lastRightFader = right;
             packetParamsBuffer[paramCount++] = $"[\"Fader-R\",{right:F2}]";
         }
 
-        if (paramCount == 0)
-            return;
+        if (paramCount == 0) return;
 
         var paramStr = string.Join(',', packetParamsBuffer.Take(paramCount));
         Send($"{{\"id\":{_lastId++},\"module\":\"analogs\",\"function\":\"write\",\"params\":[{paramStr}]}}");
@@ -455,32 +352,5 @@ class UsbmuxSpiceAPI : ISpiceAPI, IKcpCallback
 
         _pendingOutputs.Clear();
         _stopThread.Dispose();
-
-        _kcp.Dispose();
     }
-
-    // Called by KCP to send data
-    public void Output(IMemoryOwner<byte> buffer, int len)
-    {
-        try
-        {
-             if (_client != null && _client.Connected)
-             {
-                 // Frame it: [Length:4][Data]
-                 // KCP output is usually synchronous from Update.
-                 // We can write to stream. TcpClient stream writing is thread-safe?
-                 // NetworkStream is thread-safe for reading and writing separately.
-                 
-                 byte[] lenBytes = BitConverter.GetBytes(len);
-                 _stream.Write(lenBytes, 0, 4);
-                 _stream.Write(buffer.Memory.Span.Slice(0, len).ToArray(), 0, len);
-             }
-        }
-        catch (Exception ex)
-        {
-            GD.PrintErr($"Write error: {ex.Message}");
-            Connected = false;
-        }
-    }
-
 }

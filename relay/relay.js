@@ -1,108 +1,223 @@
-const usbmux = require('usbmux');
-const dgram = require('dgram');
+const net = require('net');
 
-const GAME_PORT = 1337;
-const GAME_HOST = '127.0.0.1'; // Localhost where the game is running
-const DEVICE_PORT = 1337; // Port the iOS app is listening on
+const USBMUXD_PORT = 27015;
+const USBMUXD_HOST = '127.0.0.1';
+const DEVICE_PORT = 1337;
+const GAME_PORT = 25567;
+const GAME_HOST = '127.0.0.1';
 
-const udpSocket = dgram.createSocket('udp4');
+console.log('Starting Polaris Relay (Raw Implementation)...');
 
-let deviceTunnel = null;
-let buffer = Buffer.alloc(0);
+// Protocol Constants
+const USBMUX_RESULT_OK = 0;
+const USBMUX_RESULT_BADCOMMAND = 1;
+const USBMUX_RESULT_BADDEV = 2;
+const USBMUX_RESULT_CONNREFUSED = 3;
 
-console.log('Starting Polaris Relay...');
-console.log('Waiting for iOS device...');
+// Helper to create a packet with plist payload
+function createPacket(payloadObj) {
+    const plist = createPlist(payloadObj);
+    const len = 16 + plist.length;
+    const header = Buffer.alloc(16);
 
-const listener = usbmux.createListener();
+    // Header: Length(4), Version(4), Request(4), Tag(4)
+    // Version = 1, Request = 8 (PLIST), Tag = 1
+    header.writeUInt32LE(len, 0);
+    header.writeUInt32LE(1, 4);
+    header.writeUInt32LE(8, 8); // MESSAGE_PLIST
+    header.writeUInt32LE(1, 12);
 
-listener.on('attach', (device) => {
-    console.log(`Device attached: ${device.id}`);
-    
-    // Attempt to connect
-    connectToDevice(device.id);
-});
-
-listener.on('detach', (device) => {
-    console.log(`Device detached: ${device.id}`);
-    if (deviceTunnel) {
-        deviceTunnel.end();
-        deviceTunnel = null;
-    }
-});
-
-function connectToDevice(deviceId) {
-    console.log(`Connecting to port ${DEVICE_PORT} on device ${deviceId}...`);
-    
-    usbmux.getTunnel(deviceId, DEVICE_PORT)
-        .then((tunnel) => {
-            console.log('Tunnel established!');
-            deviceTunnel = tunnel;
-            buffer = Buffer.alloc(0);
-            
-            tunnel.on('data', (chunk) => {
-                buffer = Buffer.concat([buffer, chunk]);
-                
-                while (buffer.length >= 4) {
-                    const len = buffer.readInt32LE(0);
-                    
-                    if (len < 0 || len > 65535) {
-                        console.error('Invalid length packet received, resetting buffer');
-                        buffer = Buffer.alloc(0);
-                        break;
-                    }
-
-                    if (buffer.length >= 4 + len) {
-                        const payload = buffer.slice(4, 4 + len);
-                        buffer = buffer.slice(4 + len);
-                        
-                        // Forward to Game
-                        udpSocket.send(payload, GAME_PORT, GAME_HOST, (err) => {
-                            if (err) console.error('UDP Send Error:', err);
-                        });
-                    } else {
-                        break; // Wait for more data
-                    }
-                }
-            });
-            
-            tunnel.on('close', () => {
-                console.log('Tunnel closed');
-                deviceTunnel = null;
-                // Retry?
-            });
-            
-            tunnel.on('error', (err) => {
-                console.error('Tunnel error:', err);
-                deviceTunnel = null;
-            });
-        })
-        .catch((err) => {
-            console.error('Failed to create tunnel:', err.message);
-            // Retry logic could be added here
-        });
+    return Buffer.concat([header, Buffer.from(plist)]);
 }
 
-// Handle UDP messages from Game
-udpSocket.on('message', (msg, rinfo) => {
-    // console.log(`Received ${msg.length} bytes from Game`);
-    if (deviceTunnel) {
-        try {
-            const lenBuf = Buffer.alloc(4);
-            lenBuf.writeInt32LE(msg.length, 0);
-            deviceTunnel.write(lenBuf);
-            deviceTunnel.write(msg);
-        } catch (e) {
-            console.error('Write error:', e);
+// Simple Plist Generator (XML)
+function createPlist(obj) {
+    let xml = '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n';
+
+    for (const key in obj) {
+        xml += `    <key>${key}</key>\n`;
+        const val = obj[key];
+        if (typeof val === 'string') {
+            xml += `    <string>${val}</string>\n`;
+        } else if (typeof val === 'number') {
+            xml += `    <integer>${val}</integer>\n`;
         }
+    }
+
+    xml += '</dict>\n</plist>';
+    return xml;
+}
+
+// Global state
+let deviceId = null;
+
+// ------------- Main Listener Connection -------------
+// This connection listens for Attached/Detached events
+const listenerSocket = net.createConnection({ port: USBMUXD_PORT, host: USBMUXD_HOST }, () => {
+    console.log('Connected to usbmuxd. Sending Listen packet...');
+
+    // Send Listen Packet
+    const packet = createPacket({
+        'MessageType': 'Listen',
+        'ClientVersionString': 'polaris-relay-1.0',
+        'ProgName': 'polaris-relay'
+    });
+    listenerSocket.write(packet);
+});
+
+listenerSocket.on('data', (data) => {
+    // Basic packet parser
+    // We expect a header + XML payload
+    let offset = 0;
+    while (offset < data.length) {
+        if (data.length - offset < 16) break; // Incomplete header
+
+        const len = data.readUInt32LE(offset);
+        const version = data.readUInt32LE(offset + 4);
+        const request = data.readUInt32LE(offset + 8);
+        const tag = data.readUInt32LE(offset + 12);
+
+        if (data.length - offset < len) break; // Incomplete packet
+
+        const payload = data.slice(offset + 16, offset + len).toString();
+        // console.log('Received Payload:', payload);
+
+        parsePayload(payload);
+
+        offset += len;
     }
 });
 
-udpSocket.on('listening', () => {
-    const address = udpSocket.address();
-    console.log(`UDP Relay listening on ${address.address}:${address.port} (Client Mode)`);
-    // Note: We don't bind to 1337 UDP because the GAME is listening there.
-    // We bind to a random port and send TO 1337.
-    // The Game will reply TO our random port.
+listenerSocket.on('error', (err) => {
+    console.error('Listener Socket Error:', err.message);
+    console.error('Make sure iTunes/Apple Devices is running.');
 });
 
-udpSocket.bind(0);
+listenerSocket.on('close', () => {
+    console.log('Listener Socket disconnected. Retrying in 3s...');
+    setTimeout(() => {
+        listenerSocket.connect(USBMUXD_PORT, USBMUXD_HOST);
+    }, 3000);
+});
+
+
+// ------------- Payload Parser -------------
+function parsePayload(xml) {
+    // Very naive XML parser to find MessageType and DeviceID
+    // Robust only for the expected plist format
+
+    const messageTypeMatch = xml.match(/<key>MessageType<\/key>\s*<string>(\w+)<\/string>/);
+    if (!messageTypeMatch) return;
+
+    const messageType = messageTypeMatch[1];
+    /*console.log('Message:', messageType);*/
+
+    if (messageType === 'Attached') {
+        const deviceIdMatch = xml.match(/<key>DeviceID<\/key>\s*<integer>(\d+)<\/integer>/);
+        const productIdMatch = xml.match(/<key>ProductID<\/key>\s*<integer>(\d+)<\/integer>/);
+
+        if (deviceIdMatch) {
+            const newId = parseInt(deviceIdMatch[1]);
+            console.log(`Device Attached! ID: ${newId} (Product: ${productIdMatch ? productIdMatch[1] : '?'})`);
+
+            // Connect to this device
+            connectToDeviceCombined(newId);
+        }
+    } else if (messageType === 'Detached') {
+        const deviceIdMatch = xml.match(/<key>DeviceID<\/key>\s*<integer>(\d+)<\/integer>/);
+        if (deviceIdMatch) {
+            const detachedId = parseInt(deviceIdMatch[1]);
+            console.log(`Device Detached: ${detachedId}`);
+        }
+    }
+}
+
+
+function connectToDeviceCombined(id) {
+    console.log(`Initiating connection to Device ${id} Port ${DEVICE_PORT}...`);
+
+    // Create a NEW socket to usbmuxd for the tunnel
+    const tunnel = net.createConnection({ port: USBMUXD_PORT, host: USBMUXD_HOST }, () => {
+        // Send Connect Packet
+        // Note: 'PortNumber' must be Big Endian for the Connect command in newer usbmuxd? 
+        // Actually, the usbmuxd protocol specifies PortNumber as integer in the plist.
+        // But the On-The-Wire protocol for the *tunneled* connection takes over after success.
+
+        // Wait, standard Connect message uses 'PortNumber' in the plist but with Htons (network byte order)? 
+        // The standard spec says "PortNumber: The TCP port number to connect to, in network byte order usually (big endian 16 bit swapped to 32 bit int)".
+        // Let's try standard integer first, if fails, try byte swap.
+        // Actually, for plist based usbmux, it expects the port as an integer value. But historical quirks exist.
+        // Usually: ((port << 8) & 0xFF00) | ((port >> 8) & 0x00FF)
+
+        const portSwapped = ((DEVICE_PORT << 8) & 0xFF00) | ((DEVICE_PORT >> 8) & 0x00FF);
+
+        const packet = createPacket({
+            'MessageType': 'Connect',
+            'ClientVersionString': 'polaris-relay-1.0',
+            'ProgName': 'polaris-relay',
+            'DeviceID': id,
+            'PortNumber': portSwapped
+        });
+
+        tunnel.write(packet);
+    });
+
+    tunnel.once('data', (data) => {
+        // We expect a RESULT packet
+        // Header(16) + Plist
+        // Check for <key>Number</key><integer>0</integer> inside
+        const str = data.toString();
+
+        if (str.includes('<key>Number</key>') && str.includes('<integer>0</integer>')) {
+            console.log('Tunnel Established! Bridging to Game Server...');
+
+            // Remove the header/plist from the stream?
+            // Yes, anything AFTER this packet is raw stream data.
+            // But usually 'data' chunk contains *just* the response if we are lucky.
+            // If the chunk is larger, we need to slice it.
+
+            const len = data.readUInt32LE(0);
+            const remaining = data.slice(len);
+
+            startProxy(tunnel, remaining);
+        } else {
+            console.error('Tunnel Connect Failed. Response:', str);
+            tunnel.end();
+        }
+    });
+
+    tunnel.on('error', (err) => {
+        console.error('Tunnel Socket Error:', err);
+    });
+}
+
+function startProxy(tunnel, initialData) {
+    // 1. Connect to Game Server
+    const gameSocket = net.createConnection({ port: GAME_PORT, host: GAME_HOST }, () => {
+        console.log(`Connected to Game Server ${GAME_HOST}:${GAME_PORT}`);
+
+        if (initialData && initialData.length > 0) {
+            gameSocket.write(initialData);
+        }
+    });
+
+    // 2. Pipe
+    tunnel.pipe(gameSocket);
+    gameSocket.pipe(tunnel);
+
+    // 3. Events
+    gameSocket.on('close', () => {
+        console.log('Game Server closed connection.');
+        tunnel.end();
+    });
+
+    gameSocket.on('error', (err) => {
+        console.error('Game Server Error:', err.message);
+        tunnel.end();
+    });
+
+    tunnel.on('close', () => {
+        console.log('Tunnel closed.');
+        gameSocket.end();
+    });
+}
