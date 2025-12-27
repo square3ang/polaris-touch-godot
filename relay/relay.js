@@ -4,7 +4,7 @@ const WebSocket = require('ws');
 const USBMUXD_PORT = 27015;
 const USBMUXD_HOST = '127.0.0.1';
 const DEVICE_PORT = 1337;
-const GAME_PORT = 25668;
+const GAME_PORT = 25568;
 const GAME_HOST = '127.0.0.1';
 
 console.log('Starting Polaris Relay (WebSocket Implementation)...');
