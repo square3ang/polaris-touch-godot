@@ -4,6 +4,7 @@
   "description": "Relay for Polaris Touch over USB",
   "main": "relay.js",
   "dependencies": {
-    "usbmux": "git+https://github.com/DeMille/node-usbmux.git"
+    "usbmux": "git+https://github.com/DeMille/node-usbmux.git",
+    "ws": "^8.18.3"
   }
 }
