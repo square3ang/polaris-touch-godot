@@ -2,7 +2,7 @@ name: iOS CI Build
 on: workflow_dispatch
 
 env:
-  GODOT_VERSION: 4.5
+  GODOT_VERSION: 4.5.1
   EXPORT_NAME: polaris-touch
   PROJECT_PATH: .
 
@@ -13,18 +13,20 @@ jobs:
     steps:
       - name: Setup Godot
         run: |
-          brew install --cask godot-mono
+          # Download and install Godot (Manual to ensure version match)
+          wget -q https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_mono_macos.universal.zip
+          unzip Godot_v${GODOT_VERSION}-stable_mono_macos.universal.zip
+          mv Godot_mono.app /Applications/Godot_mono.app
+          ln -s /Applications/Godot_mono.app/Contents/MacOS/Godot /usr/local/bin/godot-mono
 
-          cd ~
-          pwd
-
+          # Download and install Templates
           mkdir -v -p "/Users/runner/Library/Application Support/Godot/export_templates"
           cd "/Users/runner/Library/Application Support/Godot/export_templates"
-          wget -q https://github.com/godotengine/godot/releases/download/4.5-stable/Godot_v4.5-stable_mono_export_templates.tpz
-          unzip Godot_v4.5-stable_mono_export_templates.tpz
-          mv templates 4.5.stable.mono
+          wget -q https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_mono_export_templates.tpz
+          unzip Godot_v${GODOT_VERSION}-stable_mono_export_templates.tpz
+          mv templates ${GODOT_VERSION}.stable.mono
 
-          ls -l "/Users/runner/Library/Application Support/Godot/export_templates/4.5.stable.mono"
+          ls -l "/Users/runner/Library/Application Support/Godot/export_templates/${GODOT_VERSION}.stable.mono"
 
       - name: Checkout
         uses: actions/checkout@v4
