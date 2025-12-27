@@ -7,28 +7,23 @@ const DEVICE_PORT = 1337;
 const GAME_PORT = 25568;
 const GAME_HOST = '127.0.0.1';
 
-console.log('Starting Polaris Relay (WebSocket Implementation)...');
+console.log('Starting Polaris Relay (Robust WebSocket + Auto-Retry)...');
 
 // Helper to create a packet with plist payload
 function createPacket(payloadObj) {
     const plist = createPlist(payloadObj);
     const len = 16 + plist.length;
     const header = Buffer.alloc(16);
-
-    // Header: Length(4), Version(4), Request(4), Tag(4)
-    // Version = 1, Request = 8 (PLIST), Tag = 1
     header.writeUInt32LE(len, 0);
     header.writeUInt32LE(1, 4);
     header.writeUInt32LE(8, 8); // MESSAGE_PLIST
     header.writeUInt32LE(1, 12);
-
     return Buffer.concat([header, Buffer.from(plist)]);
 }
 
 // Simple Plist Generator (XML)
 function createPlist(obj) {
     let xml = '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n';
-
     for (const key in obj) {
         xml += `    <key>${key}</key>\n`;
         const val = obj[key];
@@ -38,13 +33,13 @@ function createPlist(obj) {
             xml += `    <integer>${val}</integer>\n`;
         }
     }
-
     xml += '</dict>\n</plist>';
     return xml;
 }
 
-// Global map to track active tunnels and their game sockets
-const activeTunnels = new Map();
+// Global state
+const attachedDevices = new Set(); // IDs of devices currently attached via USB
+const activeTunnels = new Map();   // Map<dummyKey, proxyState> - simplistic tracking
 
 // ------------- Main Listener Connection -------------
 const listenerSocket = net.createConnection({ port: USBMUXD_PORT, host: USBMUXD_HOST }, () => {
@@ -81,7 +76,6 @@ listenerSocket.on('close', () => {
     }, 3000);
 });
 
-
 // ------------- Payload Parser -------------
 function parsePayload(xml) {
     const messageTypeMatch = xml.match(/<key>MessageType<\/key>\s*<string>(\w+)<\/string>/);
@@ -95,64 +89,86 @@ function parsePayload(xml) {
 
         if (deviceIdMatch) {
             const newId = parseInt(deviceIdMatch[1]);
-            console.log(`Device Attached! ID: ${newId} (Product: ${productIdMatch ? productIdMatch[1] : '?'})`);
-            connectToDeviceCombined(newId);
+            if (!attachedDevices.has(newId)) {
+                console.log(`Device Attached! ID: ${newId} (Product: ${productIdMatch ? productIdMatch[1] : '?'})`);
+                attachedDevices.add(newId);
+                manageDeviceConnection(newId);
+            }
         }
     } else if (messageType === 'Detached') {
         const deviceIdMatch = xml.match(/<key>DeviceID<\/key>\s*<integer>(\d+)<\/integer>/);
         if (deviceIdMatch) {
             const detachedId = parseInt(deviceIdMatch[1]);
             console.log(`Device Detached: ${detachedId}`);
+            attachedDevices.delete(detachedId);
+            // The active tunnel socket close event will clean up the proxy
         }
     }
 }
 
+// ------------- Device Connection Loop -------------
+async function manageDeviceConnection(id) {
+    // Keep trying to connect as long as the device is attached
+    while (attachedDevices.has(id)) {
+        console.log(`Attempting connection to Device ${id}...`);
 
-function connectToDeviceCombined(id) {
-    console.log(`Initiating connection to Device ${id} Port ${DEVICE_PORT}...`);
-
-    const tunnel = net.createConnection({ port: USBMUXD_PORT, host: USBMUXD_HOST }, () => {
-        const portSwapped = ((DEVICE_PORT << 8) & 0xFF00) | ((DEVICE_PORT >> 8) & 0x00FF);
-        const packet = createPacket({
-            'MessageType': 'Connect',
-            'ClientVersionString': 'polaris-relay-1.0',
-            'ProgName': 'polaris-relay',
-            'DeviceID': id,
-            'PortNumber': portSwapped
-        });
-        tunnel.write(packet);
-    });
-
-    tunnel.once('data', (data) => {
-        const str = data.toString();
-        // Check success
-        if (str.includes('<key>Number</key>') && str.includes('<integer>0</integer>')) {
-            console.log('Tunnel Established! Bridging to Game Server (WebSocket)...');
-            const len = data.readUInt32LE(0);
-            const remaining = data.slice(len);
-
-            startProxy(tunnel, remaining);
-        } else {
-            console.error('Tunnel Connect Failed. Trying non-swapped port...');
-            tunnel.end();
-            connectToDeviceSimple(id);
+        try {
+            await connectToDevice(id);
+            // If connectToDevice resolves, it means the connection finished (closed).
+            // We loop back and try again appropriately.
+        } catch (err) {
+            console.error(`Connection attempt failed for Device ${id}:`, err.message);
         }
-    });
 
-    tunnel.on('error', (err) => {
-        console.error('Tunnel Socket Error:', err.message);
+        if (attachedDevices.has(id)) {
+            console.log(`Device ${id} still attached. Retrying connection in 1s...`);
+            await new Promise(r => setTimeout(r, 1000));
+        }
+    }
+    console.log(`Device ${id} connection loop ended.`);
+}
+
+
+function connectToDevice(id) {
+    return new Promise((resolve, reject) => {
+        // Try Swapped Port First
+        tryConnect(id, true, (err, tunnel, remainingData) => {
+            if (!err) {
+                // Success
+                console.log(`Tunnel Established (Swapped Port)!`);
+                startProxy(tunnel, remainingData, resolve);
+            } else {
+                console.log('Swapped port failed, trying non-swapped...');
+                // Try Non-Swapped
+                tryConnect(id, false, (err2, tunnel2, remainingData2) => {
+                    if (!err2) {
+                        console.log(`Tunnel Established (Little Endian)!`);
+                        startProxy(tunnel2, remainingData2, resolve);
+                    } else {
+                        // Both failed
+                        resolve(); // Resolve to trigger retry loop
+                    }
+                });
+            }
+        });
     });
 }
 
-function connectToDeviceSimple(id) {
-    console.log(`Retry: Connecting to Device ${id} Port ${DEVICE_PORT} (Little Endian)...`);
-    const tunnel = net.createConnection({ port: USBMUXD_PORT, host: USBMUXD_HOST }, () => {
+function tryConnect(id, swap, callback) {
+    const tunnel = net.createConnection({ port: USBMUXD_PORT, host: USBMUXD_HOST });
+    let connected = false;
+
+    tunnel.on('connect', () => {
+        const portNum = swap
+            ? ((DEVICE_PORT << 8) & 0xFF00) | ((DEVICE_PORT >> 8) & 0x00FF)
+            : DEVICE_PORT;
+
         const packet = createPacket({
             'MessageType': 'Connect',
             'ClientVersionString': 'polaris-relay-1.0',
             'ProgName': 'polaris-relay',
             'DeviceID': id,
-            'PortNumber': DEVICE_PORT
+            'PortNumber': portNum
         });
         tunnel.write(packet);
     });
@@ -160,45 +176,60 @@ function connectToDeviceSimple(id) {
     tunnel.once('data', (data) => {
         const str = data.toString();
         if (str.includes('<integer>0</integer>')) {
-            console.log('Tunnel Established (Little Endian)!');
+            connected = true;
             const len = data.readUInt32LE(0);
-            startProxy(tunnel, data.slice(len));
+            const remaining = data.slice(len);
+            toggleTunnelListeners(tunnel, false); // Remove setup listeners
+            callback(null, tunnel, remaining);
         } else {
-            console.error('Retry Failed.');
             tunnel.end();
+            callback(new Error('Connect refused'));
         }
+    });
+
+    tunnel.on('error', (err) => {
+        if (!connected) callback(err);
+    });
+
+    tunnel.on('close', () => {
+        if (!connected) callback(new Error('Closed before connect'));
     });
 }
 
-function startProxy(tunnel, initialData) {
-    if (activeTunnels.has(tunnel)) return;
+function toggleTunnelListeners(tunnel, enable) {
+    if (!enable) {
+        tunnel.removeAllListeners('data');
+        tunnel.removeAllListeners('error');
+        tunnel.removeAllListeners('close');
+    }
+}
 
+// ------------- Proxy Logic -------------
+function startProxy(tunnel, initialData, onTunnelClose) {
     const state = {
         tunnel: tunnel,
         ws: null,
         reconnectTimer: null,
         initialData: initialData
     };
-    activeTunnels.set(tunnel, state);
+
+    // tunnel is the key for now, though we don't strictly need global map if we use closure properly
+    // keeping it simple.
 
     function connectGameServer() {
         if (state.ws) {
-            state.ws.terminate();
+            try { state.ws.terminate(); } catch { }
             state.ws = null;
         }
 
         const url = `ws://${GAME_HOST}:${GAME_PORT}`;
-        console.log(`Connecting to Game Server ${url}...`);
+        // console.log(`Connecting to Game Server ${url}...`);
 
         const ws = new WebSocket(url);
         state.ws = ws;
 
         ws.on('open', () => {
             console.log('Connected to Game Server (WebSocket)!');
-
-            // Send pending initial data if exists
-            // WebSocket might send binary as Blob or ArrayBuffer?
-            // Sending Buffer directly usually works in Node `ws` package.
             if (state.initialData && state.initialData.length > 0) {
                 ws.send(state.initialData);
                 state.initialData = null;
@@ -206,32 +237,35 @@ function startProxy(tunnel, initialData) {
         });
 
         ws.on('message', (data) => {
-            // Forward Game -> Tunnel
             if (!tunnel.destroyed) {
-                tunnel.write(data);
+                // Convert WS data (Buffer/ArrayBuffer) to Buffer if needed
+                if (data instanceof ArrayBuffer) {
+                    tunnel.write(Buffer.from(data));
+                } else {
+                    tunnel.write(data);
+                }
             }
         });
 
         ws.on('close', () => {
+            // console.log('Game Server disconnected. Retrying immediately...');
             scheduleReconnect();
         });
 
         ws.on('error', (err) => {
             console.error('Game Server WebSocket error:', err.message);
-            // 'close' event is usually emitted after error
         });
     }
 
     function scheduleReconnect() {
         if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+        // User requested 0s interval
         state.reconnectTimer = setTimeout(connectGameServer, 0);
     }
 
-    // Tunnel Events
+    // Tunnel Events - re-attach
     tunnel.on('data', (data) => {
-        // Forward Tunnel -> Game
-        // WebSocket logic
-        if (data.length === 0) return; // Ignore empty frames
+        if (data.length === 0) return;
 
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
             state.ws.send(data);
@@ -239,14 +273,15 @@ function startProxy(tunnel, initialData) {
     });
 
     tunnel.on('close', () => {
-        console.log('Tunnel closed by Device. Stopping Proxy.');
+        console.log('Tunnel closed.');
         if (state.ws) state.ws.terminate();
         if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
-        activeTunnels.delete(tunnel);
+        if (onTunnelClose) onTunnelClose();
     });
 
     tunnel.on('error', (err) => {
         console.error('Tunnel Error:', err.message);
+        // Close event will invoke onTunnelClose
     });
 
     // Start
