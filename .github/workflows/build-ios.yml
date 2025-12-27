@@ -16,6 +16,7 @@ jobs:
           # Download and install Godot (Manual to ensure version match)
           wget -q https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_mono_macos.universal.zip
           unzip Godot_v${GODOT_VERSION}-stable_mono_macos.universal.zip
+          xattr -r -d com.apple.quarantine Godot_mono.app || true
           mv Godot_mono.app /Applications/Godot_mono.app
           ln -s /Applications/Godot_mono.app/Contents/MacOS/Godot /usr/local/bin/godot-mono
 
