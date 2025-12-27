@@ -6,7 +6,7 @@ const DEVICE_PORT = 1337;
 const GAME_PORT = 25567;
 const GAME_HOST = '127.0.0.1';
 
-console.log('Starting Polaris Relay (Raw Implementation)...');
+console.log('Starting Polaris Relay (Robust Implementation)...');
 
 // Protocol Constants
 const USBMUX_RESULT_OK = 0;
@@ -48,15 +48,12 @@ function createPlist(obj) {
     return xml;
 }
 
-// Global state
-let deviceId = null;
+// Global map to track active tunnels and their game sockets
+const activeTunnels = new Map();
 
 // ------------- Main Listener Connection -------------
-// This connection listens for Attached/Detached events
 const listenerSocket = net.createConnection({ port: USBMUXD_PORT, host: USBMUXD_HOST }, () => {
     console.log('Connected to usbmuxd. Sending Listen packet...');
-
-    // Send Listen Packet
     const packet = createPacket({
         'MessageType': 'Listen',
         'ClientVersionString': 'polaris-relay-1.0',
@@ -66,24 +63,14 @@ const listenerSocket = net.createConnection({ port: USBMUXD_PORT, host: USBMUXD_
 });
 
 listenerSocket.on('data', (data) => {
-    // Basic packet parser
-    // We expect a header + XML payload
     let offset = 0;
     while (offset < data.length) {
-        if (data.length - offset < 16) break; // Incomplete header
-
+        if (data.length - offset < 16) break;
         const len = data.readUInt32LE(offset);
-        const version = data.readUInt32LE(offset + 4);
-        const request = data.readUInt32LE(offset + 8);
-        const tag = data.readUInt32LE(offset + 12);
-
-        if (data.length - offset < len) break; // Incomplete packet
+        if (data.length - offset < len) break;
 
         const payload = data.slice(offset + 16, offset + len).toString();
-        // console.log('Received Payload:', payload);
-
         parsePayload(payload);
-
         offset += len;
     }
 });
@@ -103,14 +90,10 @@ listenerSocket.on('close', () => {
 
 // ------------- Payload Parser -------------
 function parsePayload(xml) {
-    // Very naive XML parser to find MessageType and DeviceID
-    // Robust only for the expected plist format
-
     const messageTypeMatch = xml.match(/<key>MessageType<\/key>\s*<string>(\w+)<\/string>/);
     if (!messageTypeMatch) return;
 
     const messageType = messageTypeMatch[1];
-    /*console.log('Message:', messageType);*/
 
     if (messageType === 'Attached') {
         const deviceIdMatch = xml.match(/<key>DeviceID<\/key>\s*<integer>(\d+)<\/integer>/);
@@ -119,8 +102,6 @@ function parsePayload(xml) {
         if (deviceIdMatch) {
             const newId = parseInt(deviceIdMatch[1]);
             console.log(`Device Attached! ID: ${newId} (Product: ${productIdMatch ? productIdMatch[1] : '?'})`);
-
-            // Connect to this device
             connectToDeviceCombined(newId);
         }
     } else if (messageType === 'Detached') {
@@ -136,11 +117,8 @@ function parsePayload(xml) {
 function connectToDeviceCombined(id) {
     console.log(`Initiating connection to Device ${id} Port ${DEVICE_PORT}...`);
 
-    // Create a NEW socket to usbmuxd for the tunnel
     const tunnel = net.createConnection({ port: USBMUXD_PORT, host: USBMUXD_HOST }, () => {
-        // Send Connect Packet
         const portSwapped = ((DEVICE_PORT << 8) & 0xFF00) | ((DEVICE_PORT >> 8) & 0x00FF);
-
         const packet = createPacket({
             'MessageType': 'Connect',
             'ClientVersionString': 'polaris-relay-1.0',
@@ -148,35 +126,27 @@ function connectToDeviceCombined(id) {
             'DeviceID': id,
             'PortNumber': portSwapped
         });
-
         tunnel.write(packet);
     });
 
     tunnel.once('data', (data) => {
-        // We expect a RESULT packet
-        // Log raw for debugging
-        console.log('Tunnel Response (Hex):', data.toString('hex'));
-        console.log('Tunnel Response (Text):', data.toString());
-
         const str = data.toString();
-
+        // Check success
         if (str.includes('<key>Number</key>') && str.includes('<integer>0</integer>')) {
             console.log('Tunnel Established! Bridging to Game Server...');
-
             const len = data.readUInt32LE(0);
-            const remaining = data.slice(len);
+            const remaining = data.slice(len); // Remaining data from iOS after handshake
 
             startProxy(tunnel, remaining);
         } else {
             console.error('Tunnel Connect Failed. Trying non-swapped port...');
             tunnel.end();
-            // Retry with Little Endian Port?
             connectToDeviceSimple(id);
         }
     });
 
     tunnel.on('error', (err) => {
-        console.error('Tunnel Socket Error:', err);
+        console.error('Tunnel Socket Error:', err.message);
     });
 }
 
@@ -194,7 +164,6 @@ function connectToDeviceSimple(id) {
     });
 
     tunnel.once('data', (data) => {
-        console.log('Retry Response (Hex):', data.toString('hex'));
         const str = data.toString();
         if (str.includes('<integer>0</integer>')) {
             console.log('Tunnel Established (Little Endian)!');
@@ -208,32 +177,79 @@ function connectToDeviceSimple(id) {
 }
 
 function startProxy(tunnel, initialData) {
-    // 1. Connect to Game Server
-    const gameSocket = net.createConnection({ port: GAME_PORT, host: GAME_HOST }, () => {
-        console.log(`Connected to Game Server ${GAME_HOST}:${GAME_PORT}`);
+    if (activeTunnels.has(tunnel)) return;
 
-        if (initialData && initialData.length > 0) {
-            gameSocket.write(initialData);
+    const state = {
+        tunnel: tunnel,
+        gameSocket: null,
+        reconnectTimer: null,
+        initialData: initialData
+    };
+    activeTunnels.set(tunnel, state);
+
+    function connectGameServer() {
+        if (state.gameSocket) {
+            state.gameSocket.destroy();
+            state.gameSocket = null;
+        }
+
+        console.log(`Connecting to Game Server ${GAME_HOST}:${GAME_PORT}...`);
+        const gameSocket = net.createConnection({ port: GAME_PORT, host: GAME_HOST }, () => {
+            console.log(`Connected to Game Server!`);
+
+            // Send pending initial data if exists
+            if (state.initialData && state.initialData.length > 0) {
+                gameSocket.write(state.initialData);
+                state.initialData = null;
+            }
+        });
+
+        state.gameSocket = gameSocket;
+
+        gameSocket.on('data', (data) => {
+            if (!tunnel.destroyed) {
+                tunnel.write(data);
+            }
+        });
+
+        gameSocket.on('close', () => {
+            console.log('Game Server disconnected. Reconnecting in 2s...');
+            scheduleReconnect();
+        });
+
+        gameSocket.on('error', (err) => {
+            console.error('Game Server connection error:', err.message);
+        });
+    }
+
+    function scheduleReconnect() {
+        if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = setTimeout(connectGameServer, 0);
+    }
+
+    // Tunnel Events
+    tunnel.on('data', (data) => {
+        // Forward Tunnel -> Game
+        if (data.length === 1) return; // Ignore empty
+
+        // If game is disconnected, we drop the data (real-time input)
+        if (state.gameSocket && !state.gameSocket.connecting && !state.gameSocket.destroyed) {
+            // console.log(`Forwarding ${data.length} bytes to Game Server`);
+            state.gameSocket.write(data);
         }
     });
 
-    // 2. Pipe
-    tunnel.pipe(gameSocket);
-    gameSocket.pipe(tunnel);
-
-    // 3. Events
-    gameSocket.on('close', () => {
-        console.log('Game Server closed connection.');
-        tunnel.end();
-    });
-
-    gameSocket.on('error', (err) => {
-        console.error('Game Server Error:', err.message);
-        tunnel.end();
-    });
-
     tunnel.on('close', () => {
-        console.log('Tunnel closed.');
-        gameSocket.end();
+        console.log('Tunnel closed by Device. Stopping Proxy.');
+        if (state.gameSocket) state.gameSocket.destroy();
+        if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+        activeTunnels.delete(tunnel);
     });
+
+    tunnel.on('error', (err) => {
+        console.error('Tunnel Error:', err.message);
+    });
+
+    // Start
+    connectGameServer();
 }
