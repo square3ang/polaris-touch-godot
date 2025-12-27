@@ -2,63 +2,46 @@ name: iOS CI Build
 on: workflow_dispatch
 
 env:
-  GODOT_VERSION: 4.5.1
+  GODOT_VERSION: 4.5
   EXPORT_NAME: polaris-touch
   PROJECT_PATH: .
 
 jobs:
   export-ios-unsigned:
     name: iOS Export
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Setup Godot
         run: |
-          # Download and install Godot (Manual to ensure version match)
-          wget -q https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_mono_macos.universal.zip
-          unzip Godot_v${GODOT_VERSION}-stable_mono_macos.universal.zip
-          xattr -r -d com.apple.quarantine Godot_mono.app || true
-          mv Godot_mono.app /Applications/Godot_mono.app
-          ln -s /Applications/Godot_mono.app/Contents/MacOS/Godot /usr/local/bin/godot-mono
+          brew install --cask godot-mono
 
-          # Download and install Templates
+          cd ~
+          pwd
+
           mkdir -v -p "/Users/runner/Library/Application Support/Godot/export_templates"
           cd "/Users/runner/Library/Application Support/Godot/export_templates"
-          wget -q https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_mono_export_templates.tpz
-          unzip Godot_v${GODOT_VERSION}-stable_mono_export_templates.tpz
-          mv templates ${GODOT_VERSION}.stable.mono
+          wget -q https://github.com/godotengine/godot/releases/download/4.5-stable/Godot_v4.5-stable_mono_export_templates.tpz
+          unzip Godot_v4.5-stable_mono_export_templates.tpz
+          mv templates 4.5.stable.mono
 
-          ls -l "/Users/runner/Library/Application Support/Godot/export_templates/${GODOT_VERSION}.stable.mono"
+          ls -l "/Users/runner/Library/Application Support/Godot/export_templates/4.5.stable.mono"
 
       - name: Checkout
         uses: actions/checkout@v4
         with:
           lfs: true
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Build Solution
-        run: |
-          cd $PROJECT_PATH
-          dotnet restore
-          dotnet build
-
       - name: Import Assets
         run: |
-          export DOTNET_ROOT=$DOTNET_ROOT
-          export GODOT_MONO_LOG_LEVEL=debug
           cd $PROJECT_PATH
-          godot-mono --headless --verbose --audio-driver Dummy --rendering-driver opengl3 --editor --quit
+          godot-mono --headless --verbose --editor --quit
 
       - name: iOS Export
         run: |
-          export DOTNET_ROOT=$DOTNET_ROOT
           mkdir -v -p build/ios
           EXPORT_DIR="$(readlink -f build)"
           cd $PROJECT_PATH
-          godot-mono --headless --verbose --audio-driver Dummy --rendering-driver opengl3 --export-release "iOS" $EXPORT_DIR/ios/polaris-touch.xcodeproj
+          godot-mono --headless --verbose --export-release "iOS" $EXPORT_DIR/ios/polaris-touch.xcodeproj
 
       - name: iOS Build
         run: |
@@ -73,4 +56,3 @@ jobs:
         with:
           name: polatouch-ipa-unsigned
           path: build/ios/build/Release-iphoneos/ipa
-
