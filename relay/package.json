@@ -2,9 +2,19 @@
   "name": "polaris-relay",
   "version": "1.0.0",
   "description": "Relay for Polaris Touch over USB",
-  "main": "relay.js",
+  "main": "dist/relay.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/relay.js",
+    "dev": "ts-node relay.ts"
+  },
   "dependencies": {
     "usbmux": "git+https://github.com/DeMille/node-usbmux.git",
-    "ws": "^8.18.3"
+    "vigemclient": "^1.5.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
   }
 }

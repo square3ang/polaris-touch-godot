@@ -7,3 +7,4 @@ _ios_export
 _android_export
 
 /relay/node_modules
+/relay/dist
